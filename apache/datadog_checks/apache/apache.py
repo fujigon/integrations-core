@@ -1,6 +1,8 @@
 # (C) Datadog, Inc. 2010-2017
 # All rights reserved
 # Licensed under Simplified BSD License (see LICENSE)
+import re
+
 from six.moves.urllib.parse import urlparse
 
 from datadog_checks.base import AgentCheck
@@ -35,6 +37,8 @@ class Apache(AgentCheck):
         'connect_timeout': {'name': 'connect_timeout', 'default': 5},
     }
 
+    VERSION_REGEX = re.compile(r'^Apache/([0-9]+\.[0-9]+\.[0-9]+)( \(.*\))?$')
+
     def __init__(self, name, init_config, instances):
         super(Apache, self).__init__(name, init_config, instances)
         self.assumed_url = {}
@@ -68,16 +72,18 @@ class Apache(AgentCheck):
             raise
         else:
             self.service_check(service_check_name, AgentCheck.OK, tags=service_check_tags)
-        server = r.headers.get("Server")
-        if server:
-            self._collect_metadata(server)
-        self.log.debug("apache check succeeded")
+
         metric_count = 0
+        version_submitted = False
         # Loop through and extract the numerical values
         for line in r.iter_lines(decode_unicode=True):
             values = line.split(': ')
             if len(values) == 2:  # match
                 metric, value = values
+                if metric == '<dl><dt>Server Version':
+                    # When the initial request contains html, this line always contain the full version.
+                    self._collect_metadata(value)
+                    version_submitted = True
                 try:
                     value = float(value)
                 except ValueError:
@@ -99,6 +105,11 @@ class Apache(AgentCheck):
                     metric_name = self.RATES[metric]
                     self.rate(metric_name, value, tags=tags)
 
+        if not version_submitted:
+            # Falls back to the server header, which may or may not contain the full version.
+            server_version = r.headers.get("Server")
+            if server_version:
+                self._collect_metadata(server_version)
         if metric_count == 0:
             if self.assumed_url.get(instance['apache_status_url']) is None and url[-5:] != '?auto':
                 self.assumed_url[instance['apache_status_url']] = '%s?auto' % url
@@ -111,7 +122,15 @@ class Apache(AgentCheck):
                 )
 
     def _collect_metadata(self, value):
-        raw_version = value.split(' ')[0]
-        version = raw_version.split('/')[1]
+        """Possible formats:
+            Apache | Apache/X | Apache/X.Y | Apache/X.Y.Z | Apache/X.Y.Z (<OS>)
+        """
+        match = re.match(self.VERSION_REGEX, value)
+
+        if not match:
+            self.log.info("Cannot parse the complete Apache version from %s.".format(value))
+            return
+
+        version = match.groups()[0]
         self.set_metadata('version', version)
         self.log.debug("found apache version %s", version)
